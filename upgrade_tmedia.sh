@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  upgrade_tmedia.sh  --  in-place upgrade for an ALREADY INSTALLED tmedia
-#  Target : BackBox / Ubuntu / Debian (v1.0.x / v1.1.x -> v1.2.0)
+#  Target : BackBox / Ubuntu / Debian (v1.0.x / v1.1.x -> v1.2.1)
 #
-#  • Replaces ONLY /opt/tmedia/tmedia.py with the embedded v1.2.0 source.
+#  • Replaces ONLY /opt/tmedia/tmedia.py with the embedded v1.2.1 source.
 #  • NEVER touches ~/.config/tmedia (API credentials + session stay intact).
 #  • Idempotent: safe to run repeatedly. Rolls back automatically on failure.
 #  • Does NOT delete itself (keep it in the repo for future upgrades).
 #
-#  New in v1.2.0: ONE API pair + every logged-in account, automatic
+#  New in v1.2.1: ONE API pair + every logged-in account, automatic
 #  account fallback for private posts, --account / --list-accounts /
 #  --add-account, channels.GetChannels resolution, ?comment= replies.
 #  Also keeps all v1.1.0 zero-login recovery and portable profiles.
 # =============================================================================
 set -Eeuo pipefail
 
-readonly TM_VERSION="1.2.0"
+readonly TM_VERSION="1.2.1"
 readonly TM_PREFIX="/opt/tmedia"
 readonly TM_PY="$TM_PREFIX/tmedia.py"
 readonly TM_VENV="$TM_PREFIX/venv"
@@ -139,6 +139,7 @@ import math
 import mimetypes
 import os
 import platform
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -152,7 +153,7 @@ from pathlib import Path
 from typing import Optional, Sequence, Union
 from urllib.parse import parse_qs, unquote, urlparse
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "tmedia"
 
 # ---------------------------------------------------------------------------
@@ -207,7 +208,7 @@ DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads"
 ENV_API_ID_KEYS = ("TMEDIA_API_ID", "TELEGRAM_API_ID", "TG_API_ID", "API_ID")
 ENV_API_HASH_KEYS = ("TMEDIA_API_HASH", "TELEGRAM_API_HASH", "TG_API_HASH", "API_HASH")
 ENV_PHONE_KEYS = ("TMEDIA_PHONE", "TELEGRAM_PHONE", "TG_PHONE", "PHONE")
-PROFILE_MEMBERS = ("config.json", "session.session")
+PROFILE_MEMBERS = ("config.json", "session.session", "active_account")
 
 # v1.2: ONE API pair, many authorised accounts. Sessions are kept separately
 # so the account that can actually see a private post is never silently lost.
@@ -385,6 +386,8 @@ def humanize_error(exc: BaseException) -> str:
         )
 
     if isinstance(exc, ValueError):
+        if "could not find the input entity" in detail.lower():
+            return "This chat is not visible to this account (not in dialogs, or you are not a member)."
         return "The link / chat could not be resolved ({0}). Check the URL.".format(detail or "invalid value")
 
     if isinstance(exc, KeyboardInterrupt):
@@ -1106,9 +1109,13 @@ def load_credentials(args) -> Credentials:
 
 
 def export_profile(target: Optional[Path]) -> int:
-    """Bundle config.json + session.session so another PC needs ZERO login."""
+    """Bundle config.json, main session and accounts/ so another PC needs ZERO login."""
     ensure_config_dir()
-    files = [path for path in (CONFIG_FILE, SESSION_FILE) if path.is_file()]
+    files = [(path, path.name) for path in (CONFIG_FILE, SESSION_FILE, ACTIVE_ACCOUNT_FILE) if path.is_file()]
+    if ACCOUNTS_DIR.is_dir():
+        for acc_file in sorted(ACCOUNTS_DIR.glob("*.session")):
+            if acc_file.is_file() and is_telethon_session(acc_file):
+                files.append((acc_file, "accounts/" + acc_file.name))
     if not files:
         console.print(Text("[!] Nothing to export yet - run tmedia once first.", style="bold red"))
         return 1
@@ -1119,8 +1126,8 @@ def export_profile(target: Optional[Path]) -> int:
     tmp = destination.with_name(destination.name + ".tmp")
     try:
         with tarfile.open(str(tmp), "w:gz") as archive:
-            for path in files:
-                archive.add(str(path), arcname=path.name)
+            for path, arcname in files:
+                archive.add(str(path), arcname=arcname)
         os.chmod(tmp, 0o600)
         os.replace(tmp, destination)
     except Exception as exc:
@@ -1130,7 +1137,7 @@ def export_profile(target: Optional[Path]) -> int:
     message = Text()
     message.append("[+] Profile: ", style="bold green")
     message.append(str(destination), style="white")
-    message.append("\n[!] Contains a LIVE Telegram auth key - keep private, NEVER commit it.", style="bold red")
+    message.append("\n[!] Contains LIVE Telegram auth key(s) - keep private, NEVER commit it.", style="bold red")
     message.append("\n    On the new machine: ", style="dim")
     message.append("tmedia --import-profile " + str(destination), style="bold cyan")
     console.print(message)
@@ -1147,20 +1154,34 @@ def import_profile(source: Path) -> int:
     try:
         with tarfile.open(str(archive_path), "r:gz") as archive:
             for member in archive.getmembers():
-                name = os.path.basename(member.name)
-                if name not in PROFILE_MEMBERS or not member.isfile() or member.size > 8 * 1024 * 1024:
+                raw_name = member.name.replace("\\", "/")
+                if raw_name.startswith("/") or ".." in raw_name.split("/"):
+                    continue
+                parts = [p for p in posixpath.normpath(raw_name).split("/") if p and p != "."]
+                if not member.isfile() or member.size > 8 * 1024 * 1024:
+                    continue
+                if len(parts) == 1 and parts[0] in PROFILE_MEMBERS:
+                    dest_dir = CONFIG_DIR
+                    rel_label = parts[0]
+                    dest_name = parts[0]
+                elif len(parts) == 2 and parts[0] == "accounts" and re.fullmatch(r"[A-Za-z0-9_.-]+\.session", parts[1]):
+                    ensure_accounts_dir()
+                    dest_dir = ACCOUNTS_DIR
+                    rel_label = "accounts/" + parts[1]
+                    dest_name = parts[1]
+                else:
                     continue
                 handle = archive.extractfile(member)
                 if handle is None:
                     continue
                 data = handle.read()
-                tmp = CONFIG_DIR / ("." + name + "." + uuid.uuid4().hex + ".tmp")
+                tmp = dest_dir / ("." + dest_name + "." + uuid.uuid4().hex + ".tmp")
                 fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as out:
                     out.write(data)
-                os.replace(tmp, CONFIG_DIR / name)
-                os.chmod(CONFIG_DIR / name, 0o600)
-                imported.append(name)
+                os.replace(tmp, dest_dir / dest_name)
+                os.chmod(dest_dir / dest_name, 0o600)
+                imported.append(rel_label)
     except Exception as exc:
         raise TMediaError("Profile is invalid or unreadable: {0}".format(humanize_error(exc)))
     if not imported:
@@ -1168,6 +1189,81 @@ def import_profile(source: Path) -> int:
     console.print(
         Text("[+] Imported {0} - run 'tmedia' with no new login.".format(", ".join(imported)), style="bold green")
     )
+    return 0
+
+
+async def login_account(args) -> int:
+    """Log in an additional Telegram account using the SAME saved API pair."""
+    if not args.no_banner:
+        print_banner()
+    creds = load_credentials(args)
+    ensure_accounts_dir()
+    explicit = None if args.login_account == "@auto" else sanitize_label(args.login_account)
+    tmp_session = ACCOUNTS_DIR / (".login-" + uuid.uuid4().hex + ".session")
+
+    console.print(Text(
+        "[*] Adding a Telegram account using your saved API ID ({0}) - no new API registration needed.".format(
+            creds.api_id
+        ),
+        style="dim green",
+    ))
+    client = TelegramClient(
+        str(tmp_session),
+        creds.api_id,
+        creds.api_hash,
+        device_model="TMEDIA CLI",
+        system_version="{0} {1}".format(platform.system(), platform.release()),
+        app_version=__version__,
+        lang_code="en",
+        flood_sleep_threshold=60,
+        request_retries=4,
+        connection_retries=4,
+        timeout=15,
+    )
+    await client.connect()
+    who = ""
+    user_id = 0
+    try:
+        if not await client.is_user_authorized():
+            await interactive_login(client, "", tmp_session)
+        me = await client.get_me()
+        user_id = getattr(me, "id", 0) or 0
+        username = getattr(me, "username", None)
+        who = "@" + username if username else (getattr(me, "first_name", None) or str(user_id))
+    except BaseException:
+        await client.disconnect()
+        for leftover in ACCOUNTS_DIR.glob(tmp_session.name + "*"):
+            leftover.unlink(missing_ok=True)
+        raise
+    await client.disconnect()
+
+    label = explicit or sanitize_label(
+        (who.lstrip("@") if who.startswith("@") else "") or ("user_" + str(user_id or "account"))
+    )
+    if label == "main":
+        label = "account2"
+    target = ACCOUNTS_DIR / (label + ".session")
+    if explicit is None:
+        index = 2
+        while target.exists():
+            target = ACCOUNTS_DIR / ("{0}_{1}.session".format(label, index))
+            index += 1
+        label = target.stem
+
+    os.replace(tmp_session, target)
+    os.chmod(target, 0o600)
+    for leftover in ACCOUNTS_DIR.glob(tmp_session.name + "*"):
+        leftover.unlink(missing_ok=True)
+    harden_session_permissions()
+
+    console.print(Text(
+        "[+] Logged in as {0} -> saved as account '{1}' (same API, main account untouched).".format(who, label),
+        style="bold green",
+    ))
+    console.print(Text(
+        "    tmedia will now try all accounts automatically, or pin it:  tmedia --account {0} -l <link>".format(label),
+        style="dim",
+    ))
     return 0
 
 
@@ -1369,9 +1465,9 @@ async def resolve_private_chat(client: TelegramClient, channel_id: int) -> objec
     """
     Turn a bare ``-100…`` id into an entity with an access_hash.
 
-    A fresh session has no entity cache: try the cache/API, then a direct
-    channels.GetChannels (works when the account is a member), then warm the
-    cache from the dialog list. Failure is *per-account*: AccountPool simply
+    A fresh session has no entity cache: try the cache/API, then direct
+    channels.GetChannels(InputChannel(..., 0)), then warm the cache from both
+    active and archived dialogs. Failure is *per-account*: AccountPool simply
     moves on to the next logged-in account.
     """
     peer_id = int("-100" + str(channel_id))
@@ -1384,21 +1480,40 @@ async def resolve_private_chat(client: TelegramClient, channel_id: int) -> objec
 
     try:
         result = await client(
-            functions.channels.GetChannelsRequest(id=[types.PeerChannel(channel_id)])
+            functions.channels.GetChannelsRequest(id=[types.InputChannel(channel_id, 0)])
         )
+        for chat in getattr(result, "chats", None) or []:
+            if getattr(chat, "id", None) == channel_id:
+                return chat
+    except Exception as exc:
+        if type(exc).__name__ in {"ChannelPrivateError", "ChatForbiddenError", "UserNotParticipantError"}:
+            raise AccountAccessError(
+                "This account is not a member of private channel {0}.".format(channel_id)
+            )
+
+    try:
+        result = await client(functions.messages.GetChatsRequest(id=[channel_id]))
         for chat in getattr(result, "chats", None) or []:
             if getattr(chat, "id", None) == channel_id:
                 return chat
     except Exception:
         pass
 
-    try:
-        async for dialog in client.iter_dialogs():
-            entity = dialog.entity
-            if getattr(entity, "id", None) == channel_id:
-                return entity
-    except Exception:
-        pass
+    for kwargs in ({}, {"folder": 1}):
+        try:
+            async for dialog in client.iter_dialogs(**kwargs):
+                entity = dialog.entity
+                if getattr(entity, "id", None) == channel_id:
+                    return entity
+                if getattr(entity, "linked_monoforum_id", None) == channel_id:
+                    try:
+                        return await client.get_entity(types.PeerChannel(channel_id))
+                    except Exception:
+                        pass
+        except TypeError:
+            pass
+        except Exception:
+            pass
 
     raise AccountAccessError(
         "This account is not a member of private channel {0} (or the link is invalid).".format(channel_id)
@@ -1448,7 +1563,7 @@ async def resolve_message(client: TelegramClient, link: TelegramLink):
         try:
             message = await client.get_messages(types.PeerChannel(link.channel_id), ids=link.message_id)
         except Exception as exc:
-            if last_error is None:
+            if not isinstance(exc, ValueError) or last_error is None:
                 last_error = exc
 
     if message is None and link.kind == "private":
@@ -1456,7 +1571,15 @@ async def resolve_message(client: TelegramClient, link: TelegramLink):
             entity = await resolve_private_chat(client, link.channel_id)
             message = await client.get_messages(entity, ids=link.message_id)
         except Exception as exc:
-            if last_error is None:
+            # Prefer definitive AccountAccessError / RPC errors over an earlier
+            # cache-miss ValueError so we never hide "not a member" behind an
+            # internal entity-cache message.
+            if (
+                isinstance(exc, TMediaError)
+                or not isinstance(exc, ValueError)
+                or isinstance(last_error, ValueError)
+                or last_error is None
+            ):
                 last_error = exc
 
     if message is None and link.kind == "public":
@@ -1464,7 +1587,12 @@ async def resolve_message(client: TelegramClient, link: TelegramLink):
             entity = await client.get_entity(link.entity)
             message = await client.get_messages(entity, ids=link.message_id)
         except Exception as exc:
-            if last_error is None:
+            if (
+                isinstance(exc, TMediaError)
+                or not isinstance(exc, ValueError)
+                or isinstance(last_error, ValueError)
+                or last_error is None
+            ):
                 last_error = exc
 
     if message is None:
@@ -1751,7 +1879,10 @@ async def download_with_accounts(pool: AccountPool, link: TelegramLink,
                 tried, errors[-1][1] if errors else "private content"
             )
         )
-    raise TMediaError(errors[-1][1] if errors else "This post could not be accessed.")
+    detail = errors[-1][1] if errors else "This post could not be accessed."
+    if link.kind == "private" and len(pool.accounts) == 1 and len(registered_accounts()) <= 1:
+        detail += " If another account is a member, add it with 'tmedia --login-account' (same API)."
+    raise TMediaError(detail)
 
 
 async def process_link(source, link: TelegramLink, opts: Options, reporter) -> str:
@@ -2055,7 +2186,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  tmedia --import-profile ~/p.tar.gz      zero-login setup on that PC\n"
             "  tmedia --api-id 12345 --api-hash HASH   set credentials non-interactively\n"
             "  tmedia --list-accounts                  every logged-in account\n"
-            "  tmedia --add-account work --session S   register another account (zero login)\n"
+            "  tmedia --login-account [NAME]           log in another account (uses same API)\n"
+            "  tmedia --add-account work --session S   register an existing .session (zero login)\n"
             "  tmedia --account work -l URL            pin that account for a private post\n"
             "  tmedia --single-account -l URL          never try other accounts\n"
             "  tmedia --logout                         remove saved session\n"
@@ -2085,7 +2217,8 @@ def build_parser() -> argparse.ArgumentParser:
     accounts = parser.add_argument_group("accounts (v1.2: one API pair, every login)")
     accounts.add_argument("--account", metavar="NAME", help="pin a registered account (see --list-accounts)")
     accounts.add_argument("--session", metavar="PATH", help="use/pin a specific Telethon .session for this run")
-    accounts.add_argument("--add-account", metavar="NAME", help="register an authorised session as a named account")
+    accounts.add_argument("--login-account", nargs="?", const="@auto", metavar="NAME", help="log in another Telegram account using the same saved API")
+    accounts.add_argument("--add-account", metavar="NAME", help="register an authorised .session file as a named account")
     accounts.add_argument("--list-accounts", action="store_true", help="offline list of usable accounts")
     accounts.add_argument("--single-account", action="store_true", help="do not fall back to other accounts")
 
@@ -2156,12 +2289,13 @@ async def run(args) -> int:
         status.append(")\n  Session:   ", style="dim")
         status.append(str(accounts[0].path), style="dim")
         status.append("\n  Accounts:  ", style="dim")
-        status.append(
-            "{0} available{1}".format(
-                len(accounts), " - private posts auto-fallback" if try_all else " (single-account mode)"
-            ),
-            style="dim",
-        )
+        if try_all:
+            accounts_note = "{0} available - private posts auto-fallback".format(len(accounts))
+        elif single:
+            accounts_note = "{0} available (single-account mode)".format(len(accounts))
+        else:
+            accounts_note = "1 available (add another with: tmedia --login-account)"
+        status.append(accounts_note, style="dim")
         status.append("\n  Downloads: ", style="dim")
         status.append(str(opts.output), style="dim")
         console.print(Panel(status, title="Session", border_style="green", title_align="left"))
@@ -2189,6 +2323,8 @@ def main() -> int:
             return list_accounts()
         if args.add_account:
             return add_account(args.add_account, Path(args.session) if args.session else None)
+        if args.login_account is not None:
+            return asyncio.run(login_account(args))
         if args.doctor:
             return doctor()
         if args.logout:

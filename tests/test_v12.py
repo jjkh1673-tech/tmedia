@@ -84,7 +84,7 @@ def opts(**overrides):
 
 # ---------------------------------------------------------------------------
 print("A) version, links, error classification")
-ok(m.__version__ == "1.2.0", "version is 1.2.0")
+ok(m.__version__ == "1.2.1", "version is 1.2.1")
 cases = [
     ("https://t.me/durov/123", "durov", 123, None, None),
     ("https://t.me/c/1234567890/42", -1001234567890, 42, None, None),
@@ -195,6 +195,55 @@ replies = SimpleNamespace(id=45, file=None, media=None, date=None)
 cclient = FakeClient("comments", comment=replies)
 ok(run(m.resolve_message(cclient, clink)).id == 45, "?comment= discussion reply resolved")
 
+# Reproduces the exact DarkMatter trace bug: cache-miss ValueError MUST NOT
+# mask the clear AccountAccessError when the account is not a member.
+class NotMemberClient:
+    async def get_messages(self, entity, ids=None, **kwargs):
+        raise ValueError("Could not find the input entity for PeerChannel(channel_id=3531073564)")
+
+    async def get_entity(self, entity):
+        raise ValueError("Could not find the input entity for PeerChannel(channel_id=3531073564)")
+
+    async def get_input_entity(self, entity):
+        raise ValueError("Could not find the input entity for PeerChannel(channel_id=3531073564)")
+
+    async def __call__(self, request):
+        return SimpleNamespace(chats=[])
+
+    def iter_dialogs(self, **kwargs):
+        async def gen():
+            if False:
+                yield None
+        return gen()
+
+
+try:
+    run(m.resolve_message(NotMemberClient(), m.parse_link("https://t.me/c/3531073564/100")))
+    raise AssertionError("expected AccountAccessError")
+except m.AccountAccessError as exc:
+    ok("not a member of private channel 3531073564" in str(exc),
+       "AccountAccessError not masked by cache-miss ValueError")
+
+ok("docs.telethon.dev" not in m.humanize_error(ValueError("Could not find the input entity for PeerChannel(channel_id=1)")),
+   "humanize_error suppresses Telethon docs URL on entity ValueError")
+
+# Archived dialog (folder=1) recovery
+class ArchivedClient(NotMemberClient):
+    async def get_messages(self, entity, ids=None, **kwargs):
+        if isinstance(entity, FakeChannel):
+            return SimpleNamespace(id=ids, file=None, media=None, date=None)
+        raise ValueError("Could not find the input entity")
+
+    def iter_dialogs(self, **kwargs):
+        async def gen():
+            if kwargs.get("folder") == 1:
+                yield SimpleNamespace(entity=FakeChannel(3531073564))
+        return gen()
+
+
+ok(run(m.resolve_message(ArchivedClient(), m.parse_link("https://t.me/c/3531073564/100"))).id == 100,
+   "archived private channel (folder=1) resolved")
+
 # ---------------------------------------------------------------------------
 print("D) fallback: first account cannot see the private post, second can")
 DATA = b"\x00tmedia-exact-bytes\xff" * 97
@@ -291,5 +340,87 @@ ok(not list(WORK.rglob("*.tar.gz")), "no profile archives created by tests")
 parser = m.build_parser()
 a = parser.parse_args(["--account", "third", "--single-account", "-l", "https://t.me/c/1/2"])
 ok(a.account == "third" and a.single_account and a.link, "CLI flags parsed")
+a_login = parser.parse_args(["--login-account"])
+ok(a_login.login_account == "@auto", "--login-account accepts omitted label")
+a_login_named = parser.parse_args(["--login-account", "alt"])
+ok(a_login_named.login_account == "alt", "--login-account accepts named label")
+
+print("F) --login-account (reuses ONE API) + multi-account profile export/import")
+m.save_credentials(m.Credentials(12345, "a" * 32, "+8801000000000"))
+main_hash_before = m.session_signature(main_session)
+
+
+class LoginFakeClient:
+    def __init__(self, session_path, api_id, api_hash, **kw):
+        self.session_path = Path(session_path)
+        self.api_id = api_id
+        self.api_hash = api_hash
+
+    async def connect(self):
+        make_session(self.session_path, b"d" * 256)
+
+    async def is_user_authorized(self):
+        return False
+
+    async def get_me(self):
+        return SimpleNamespace(id=999, username="second_acc", first_name="Second")
+
+    async def disconnect(self):
+        pass
+
+
+login_phones = []
+
+
+async def fake_interactive_login(client, phone, session_path=None):
+    login_phones.append(phone)
+
+
+orig_tg, orig_login = m.TelegramClient, m.interactive_login
+m.TelegramClient, m.interactive_login = LoginFakeClient, fake_interactive_login
+try:
+    la_args = parser.parse_args(["--no-banner", "--login-account"])
+    ok(run(m.login_account(la_args)) == 0, "--login-account succeeded using saved API")
+finally:
+    m.TelegramClient, m.interactive_login = orig_tg, orig_login
+
+ok(login_phones == [""], "--login-account prompts for new phone (ignores account1 phone)")
+ok(m.session_signature(main_session) == main_hash_before, "main session untouched")
+ok((m.ACCOUNTS_DIR / "second_acc.session").is_file(), "new account session saved in accounts/")
+ok((m.ACCOUNTS_DIR / "second_acc.session").stat().st_mode & 0o777 == 0o600, "new session is 0600")
+
+# Multi-account profile export + import + traversal rejection
+import tarfile as _tarfile, io as _io
+profile_tar = WORK / "multi-profile.tar.gz"
+ok(m.export_profile(profile_tar) == 0, "multi-account profile exported")
+ok((profile_tar.stat().st_mode & 0o777) == 0o600, "profile tarball is 0600")
+# Inject a path-traversal member to ensure import_profile rejects it
+evil_tar = WORK / "evil-profile.tar.gz"
+with _tarfile.open(str(profile_tar), "r:gz") as src_tf, _tarfile.open(str(evil_tar), "w:gz") as dst_tf:
+    for mem in src_tf.getmembers():
+        dst_tf.addfile(mem, src_tf.extractfile(mem))
+    evil = _tarfile.TarInfo("../pwned")
+    evil.size = 4
+    dst_tf.addfile(evil, _io.BytesIO(b"evil"))
+
+new_cfg = WORK / "new-pc-cfg"
+old_cfg, old_cf, old_sf, old_ad, old_af = m.CONFIG_DIR, m.CONFIG_FILE, m.SESSION_FILE, m.ACCOUNTS_DIR, m.ACTIVE_ACCOUNT_FILE
+m.CONFIG_DIR = new_cfg
+m.CONFIG_FILE = new_cfg / "config.json"
+m.SESSION_FILE = new_cfg / "session.session"
+m.ACCOUNTS_DIR = new_cfg / "accounts"
+m.ACTIVE_ACCOUNT_FILE = new_cfg / "active_account"
+try:
+    ok(m.import_profile(evil_tar) == 0, "profile imported safely")
+    ok((new_cfg / "config.json").is_file() and (new_cfg / "session.session").is_file(),
+       "main config + session imported")
+    ok((new_cfg / "accounts" / "second_acc.session").is_file(),
+       "extra account imported with zero login")
+    ok(not (WORK / "pwned").exists() and not (new_cfg.parent / "pwned").exists(),
+       "path traversal rejected")
+finally:
+    m.CONFIG_DIR, m.CONFIG_FILE, m.SESSION_FILE, m.ACCOUNTS_DIR, m.ACTIVE_ACCOUNT_FILE = (
+        old_cfg, old_cf, old_sf, old_ad, old_af
+    )
 
 print("\n*** V1.2 TEST SUITE PASSED ***")

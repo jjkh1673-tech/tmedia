@@ -13,7 +13,7 @@
 
 **Telegram media downloader for the terminal — exact original files, zero fuss.**
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Termux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) ![Status](https://img.shields.io/badge/release-v1.2.0-cyan)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Termux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) ![Status](https://img.shields.io/badge/release-v1.2.1-cyan)
 
 [Features](#features) · [Zero-login setup](#zero-login-setup) · [Universal access](#universal-access-v12--one-api-pair-every-logged-in-account) · [Install](#install) · [Usage](#usage) · [CLI](#cli-reference) · [Security](#security--privacy) · [Contributing](#contributing)
 
@@ -158,7 +158,8 @@ every authorised session it finds:
 
 ```bash
 tmedia --list-accounts                                  # which logins exist (offline)
-tmedia --add-account work --session ~/work.session      # register a login, ZERO code
+tmedia --login-account [work]                           # log in another account (SAME API)
+tmedia --add-account work --session ~/work.session      # or reuse an existing .session
 tmedia --account work -l https://t.me/c/1234567890/42  # pin the account that can see it
 tmedia -l <link>                                        # default: auto-fallback
 tmedia --single-account -l <link>                       # never switch accounts
@@ -168,7 +169,8 @@ tmedia --single-account -l <link>                       # never switch accounts
   duplicates are detected by content hash and originals are never modified.
 * Only genuine access errors trigger a switch — a broken download is reported,
   never silently retried on another account. Batch mode still continues.
-* Private links now also try `PeerChannel(...)` and `channels.GetChannels`, so a
+* Private links now also try `PeerChannel(...)`, `channels.GetChannels(InputChannel(..., 0))`,
+  `messages.GetChats`, and **both** active and archived (`folder=1`) dialogs, so a
   **fresh** session can read `/c/` links immediately. Forum topics and
   `?comment=<id>` replies are parsed and resolved best effort.
 * `--doctor` and `--session` panel show the active account and how many
@@ -280,7 +282,8 @@ and the rest still download.
 | `--doctor` | — | Offline credentials / session / accounts / Desktop check |
 | `--account NAME` | auto | Pin a registered account for this run |
 | `--session PATH` | — | Use/pin a specific Telethon `.session` |
-| `--add-account NAME` | — | Register another login (use with `--session`) |
+| `--login-account [NAME]` | auto | Log in another account using the SAME saved API |
+| `--add-account NAME` | — | Register an existing `.session` (use with `--session`) |
 | `--list-accounts` | — | Offline list of usable accounts |
 | `--single-account` | off | Never fall back to other accounts |
 | `--logout` | — | Delete local session + credentials |

@@ -4,6 +4,27 @@ All notable changes to tmedia are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [1.2.1] — 2026-11-19
+
+### Added
+- `tmedia --login-account [NAME]` — log in a second/third Telegram account using
+  the **exact same saved API pair** (`config.json`), without touching `main` or
+  registering another API app on `my.telegram.org`.
+- Multi-account `--export-profile` / `--import-profile`: bundles `config.json`,
+  `session.session`, `active_account` and `accounts/*.session` (still `0600` and
+  strictly whitelist-checked against path traversal).
+
+### Fixed
+- `resolve_message()` no longer lets an earlier cold-cache `ValueError` hide the
+  definitive `AccountAccessError` ("not a member of private channel ...").
+- `resolve_private_chat()` now passes `types.InputChannel(id, 0)` to
+  `channels.GetChannels` (actually reaches Telegram instead of failing on local
+  cache), checks archived dialogs (`folder=1`), and checks `messages.GetChats`.
+- `humanize_error()` converts any raw Telethon `Could not find the input entity`
+  `ValueError` into one calm sentence (never prints docs URLs).
+- Session panel no longer prints `(single-account mode)` when only 1 account is
+  registered unless `--single-account` was explicitly set.
+
 ## [1.2.0] — 2026-11-19
 
 ### Added — universal access / multi-account
