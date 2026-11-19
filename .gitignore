@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# NEVER commit a Telegram session or an API credential. A session file holds a
+# live auth key; anyone with it can read your account without a login code.
+# ---------------------------------------------------------------------------
+*.session
+*.session-journal
+*.session-wal
+config.json
+credentials.json
+tmedia-profile-*.tar.gz
+*.tar.gz
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# tmedia runtime leftovers
+.tmedia-*.part
+.tmedia-*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
