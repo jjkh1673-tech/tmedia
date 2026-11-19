@@ -65,6 +65,7 @@ and CLI smoke checks; please add a unit test for any new behaviour.
 
 - [ ] `bash -n` on every shell script
 - [ ] `python3 src/tmedia.py --version` and `--help` succeed
+- [ ] `python3 tests/test_v12.py` and `python3 tests/test_engine.py` pass
 - [ ] both installers embed the current `src/tmedia.py`
 - [ ] `CHANGELOG.md` updated
 - [ ] no secrets in the diff

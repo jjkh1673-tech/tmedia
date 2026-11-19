@@ -13,9 +13,9 @@
 
 **Telegram media downloader for the terminal — exact original files, zero fuss.**
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Termux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) ![Status](https://img.shields.io/badge/release-v1.1.0-cyan)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20Termux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) ![Status](https://img.shields.io/badge/release-v1.2.0-cyan)
 
-[Features](#features) · [Zero-login setup](#zero-login-setup) · [Install](#install) · [Usage](#usage) · [CLI](#cli-reference) · [Security](#security--privacy) · [Contributing](#contributing)
+[Features](#features) · [Zero-login setup](#zero-login-setup) · [Universal access](#universal-access-v12--one-api-pair-every-logged-in-account) · [Install](#install) · [Usage](#usage) · [CLI](#cli-reference) · [Security](#security--privacy) · [Contributing](#contributing)
 
 </div>
 
@@ -47,6 +47,7 @@ every machine you own.
 | 📂 **Batch mode** | `zenity` file picker with a guaranteed headless fallback; one bad link never aborts the batch. |
 | 🛡️ **Human errors** | Invalid URLs, non-member channels, deleted posts, `FloodWait`, network drops → one calm line each. |
 | 🧩 **Cross-platform** | Ubuntu/BackBox installer, Windows PowerShell setup, Termux setup. |
+| 🧠 **Universal access** | ONE API pair + every authorised account; pin one with `--account`, auto-fallback when a private post is invisible. |
 
 ---
 
@@ -135,6 +136,50 @@ A small `>` guide appears inline — no full-screen panel, no confusion:
 
 ---
 
+## Universal access (v1.2) — one API pair, every logged-in account
+
+> **The problem:** a private post link failed because the session tmedia picked
+> belonged to a *different* Telegram account. Telegram only shows private
+> channel posts to members, so no client can bypass that — but tmedia can use
+> the account that actually has access.
+
+`api_id` / `api_hash` belong to the **app**, not to an account; the account is
+stored in the `.session`. tmedia therefore uses **one API pair** and keeps
+every authorised session it finds:
+
+```
+  tmedia -l <link>
+       │
+       ├─ 1. pinned account (--account / --session / active_account) ───✔ done
+       ├─ 2. Telegram: "not a member / not visible" → try account #2 ───✔ done
+       ├─ 3. ... up to 8 discovered accounts, connected lazily
+       └─ 4. nobody can see it → clean "join the channel" message
+```
+
+```bash
+tmedia --list-accounts                                  # which logins exist (offline)
+tmedia --add-account work --session ~/work.session      # register a login, ZERO code
+tmedia --account work -l https://t.me/c/1234567890/42  # pin the account that can see it
+tmedia -l <link>                                        # default: auto-fallback
+tmedia --single-account -l <link>                       # never switch accounts
+```
+
+* Sessions live in `~/.config/tmedia/accounts/` (dir `0700`, files `0600`);
+  duplicates are detected by content hash and originals are never modified.
+* Only genuine access errors trigger a switch — a broken download is reported,
+  never silently retried on another account. Batch mode still continues.
+* Private links now also try `PeerChannel(...)` and `channels.GetChannels`, so a
+  **fresh** session can read `/c/` links immediately. Forum topics and
+  `?comment=<id>` replies are parsed and resolved best effort.
+* `--doctor` and `--session` panel show the active account and how many
+  fallbacks are available.
+
+> Telegram **protected content** (`noforwards`) and channels none of your
+> accounts joined remain inaccessible — that is a server-side rule, not a
+> tmedia limitation.
+
+---
+
 ## Install
 
 ### Linux — fresh install (Ubuntu / BackBox / Debian)
@@ -154,7 +199,7 @@ temp files, the pip cache and the installer itself.
 
 > Keep a copy: `cp install_tmedia.sh ~/install_tmedia.sh && sudo bash ~/install_tmedia.sh`
 
-### Linux — upgrade an already-installed v1.0.x (your case)
+### Linux — upgrade an already-installed v1.0.x / v1.1.x (your case)
 
 ```bash
 chmod +x upgrade_tmedia.sh
@@ -232,13 +277,19 @@ and the rest still download.
 | `--api-id`, `--api-hash`, `--phone` | — | Set/save credentials non-interactively |
 | `--export-profile [FILE]` | `./tmedia-profile-<date>.tar.gz` | Bundle login for another PC |
 | `--import-profile FILE` | — | Restore login with zero new code |
-| `--doctor` | — | Offline credentials / session / Desktop check |
+| `--doctor` | — | Offline credentials / session / accounts / Desktop check |
+| `--account NAME` | auto | Pin a registered account for this run |
+| `--session PATH` | — | Use/pin a specific Telethon `.session` |
+| `--add-account NAME` | — | Register another login (use with `--session`) |
+| `--list-accounts` | — | Offline list of usable accounts |
+| `--single-account` | off | Never fall back to other accounts |
 | `--logout` | — | Delete local session + credentials |
 | `--no-banner` | off | Suppress ASCII banner |
 | `-V, --version` | — | Print version |
 
 Environment: `TMEDIA_CONFIG_DIR`, `TMEDIA_DOWNLOAD_DIR`, `TMEDIA_API_ID`,
-`TMEDIA_API_HASH`, `TMEDIA_PHONE` (+ aliases listed above).
+`TMEDIA_API_HASH`, `TMEDIA_PHONE` (+ aliases listed above),
+`TMEDIA_SESSION`, `TMEDIA_ACCOUNT`, `TMEDIA_SINGLE_ACCOUNT`.
 
 ---
 
@@ -251,14 +302,17 @@ Environment: `TMEDIA_CONFIG_DIR`, `TMEDIA_DOWNLOAD_DIR`, `TMEDIA_API_ID`,
 | `https://t.me/c/1234567890/42` | Private / restricted post |
 | `https://t.me/c/1234567890/12/987` | Post inside a forum topic |
 | `https://telegram.me/name/9` | Legacy host aliases |
+| `https://t.me/c/1234567890/42?thread=12` | Thread / topic hint |
+| `https://t.me/durov/123?comment=45` | Discussion reply (best effort) |
 
-Private `/c/` links become the MTProto id `-100…`; if Telethon has not cached
-the channel yet, tmedia warms the entity cache from your dialogs and retries.
-**You must already be a member** — this is not an access-control bypass.
+Private `/c/` links become the MTProto id `-100…`; tmedia retries with
+`PeerChannel(...)`, `channels.GetChannels` and a warmed dialog cache, then
+tries the other logged-in accounts. **At least one of your accounts must be
+a member** — this is not an access-control bypass. See below.
 
 Not supported: invite links (`t.me/+…`, `joinchat`), stories (`/s/…`),
-`?comment=` replies (the parent post is downloaded), and album siblings (only
-the linked message is fetched).
+album siblings (only the linked message is fetched). `?comment=` replies are
+resolved best effort; if the reply cannot be found the parent post is used.
 
 ---
 
@@ -312,12 +366,16 @@ tmedia/
 │   ├── setup_windows.ps1
 │   └── setup_termux.sh
 ├── examples/links.example.txt
+├── tests/
+│   ├── test_v12.py               accounts / fallback / resolution
+│   └── test_engine.py            bytes / batch / menu regression
 ├── scripts/publish_github.sh     one-command public repo publish (gh CLI)
-└── .github/workflows/ci.yml      syntax + embedded-source sync checks
+└── .github/workflows/ci.yml      syntax + sync + two offline test suites
 ```
 
 The two shell scripts embed `src/tmedia.py` verbatim; CI fails if they drift
-out of sync. CI also runs `bash -n`, `ast.parse`, `--version` and `--help`.
+out of sync. CI also runs `bash -n`, `ast.parse`, `--version`, `--help`,
+`tests/test_v12.py` and `tests/test_engine.py` (no Telegram account needed).
 
 ### Publish to GitHub (public)
 

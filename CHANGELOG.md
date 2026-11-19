@@ -4,6 +4,44 @@ All notable changes to tmedia are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-11-19
+
+### Added — universal access / multi-account
+- ONE `api_id`/`api_hash` pair now drives **every authorised session** found on
+  the machine. Sessions are registered (dedup by content hash) in
+  `~/.config/tmedia/accounts/` with mode `0600`; originals are never modified.
+- `--account NAME`, `--session PATH`, `TMEDIA_ACCOUNT`, `TMEDIA_SESSION` — pin
+  the account that can see the post. Pinning is persisted in `active_account`.
+- `--add-account NAME [--session PATH]` and `--list-accounts` — register/inspect
+  logins offline with **zero new login code**.
+- `AccountPool` automatic fallback: when Telegram reports the primary account
+  cannot see a private/restricted post, the next account is connected lazily and
+  retried (up to 8). `--single-account` / `TMEDIA_SINGLE_ACCOUNT` disables it.
+- `is_access_error()` distinguishes "this account cannot see it" from a real
+  download failure; batch mode still continues after per-link failures.
+- Fresh-session private resolution now tries `types.PeerChannel(...)`,
+  `channels.GetChannels` and dialog-cache warming before giving up.
+- `?comment=<id>` / `?reply=<id>` discussion replies, `?thread=<id>` and forum
+  topic ids are parsed and resolved best effort.
+- `tests/test_v12.py` and `tests/test_engine.py`: offline suites for accounts,
+  fallback, private resolution, exact bytes, mtime, batch, menu and link files;
+  both run in CI.
+
+### Changed
+- `--doctor` reports usable accounts and the pinned account.
+- Session panel shows the active account label and fallback count.
+- `open_client()` accepts a session path and never prompts for a login code on
+  a fallback account; `interactive_login()` shows the actual session path.
+- `harden_session_permissions()` also covers `accounts/` and `active_account`.
+- Installer / upgrader embed the v1.2.0 source; upgrader accepts v1.0.x and
+  v1.1.x installs and still preserves `~/.config/tmedia`.
+
+### Notes
+- Telegram's server-side rules are unchanged: a private channel post is visible
+  only to member accounts, and protected (`noforwards`) content stays
+  restricted. tmedia now uses the account that has legitimate access instead of
+  failing with the wrong one.
+
 ## [1.1.0] — 2026-11-18
 
 ### Added — zero-login credential & session recovery

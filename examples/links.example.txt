@@ -13,3 +13,6 @@ https://t.me/c/1234567890/43?single
 
 # --- post inside a forum topic: /c/<chat>/<topic>/<message> ---
 https://t.me/c/1234567890/12/987
+
+# --- discussion reply (best effort) ---
+https://t.me/durov/123?comment=45

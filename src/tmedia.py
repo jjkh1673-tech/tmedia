@@ -19,6 +19,11 @@ Design goals
   existing authorised Telethon session anywhere on the machine is reused.
   `--export-profile` / `--import-profile` move a login between PCs with no
   new code. Only if nothing is recoverable is a compact `>` guide shown.
+* Universal access (v1.2): ONE api_id/api_hash pair drives every authorised
+  session on this machine. Pin the account that can see the post with
+  `--account`; otherwise tmedia automatically tries the other logged-in
+  accounts when a private/restricted post is invisible, so public and private
+  links both resolve with zero new login.
 * Async I/O plus an optional multi-connection (strided chunk) downloader for
   large documents, with an automatic, transparent fallback to Telethon's
   battle-tested ``download_media`` if the fast path cannot be used.
@@ -43,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import mimetypes
@@ -59,9 +65,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "tmedia"
 
 # ---------------------------------------------------------------------------
@@ -69,7 +75,7 @@ APP_NAME = "tmedia"
 # ---------------------------------------------------------------------------
 
 try:
-    from telethon import TelegramClient
+    from telethon import TelegramClient, functions
     import telethon.errors as tg_errors
     from telethon.tl import types
 
@@ -117,6 +123,12 @@ ENV_API_ID_KEYS = ("TMEDIA_API_ID", "TELEGRAM_API_ID", "TG_API_ID", "API_ID")
 ENV_API_HASH_KEYS = ("TMEDIA_API_HASH", "TELEGRAM_API_HASH", "TG_API_HASH", "API_HASH")
 ENV_PHONE_KEYS = ("TMEDIA_PHONE", "TELEGRAM_PHONE", "TG_PHONE", "PHONE")
 PROFILE_MEMBERS = ("config.json", "session.session")
+
+# v1.2: ONE API pair, many authorised accounts. Sessions are kept separately
+# so the account that can actually see a private post is never silently lost.
+ACCOUNTS_DIR = CONFIG_DIR / "accounts"
+ACTIVE_ACCOUNT_FILE = CONFIG_DIR / "active_account"
+MAX_EXTRA_ACCOUNTS = 8
 
 # All spellings accepted in JSON / .env configs (canonical first).
 API_ID_ALIASES = ("api_id", "API_ID", "apiId", "app_id") + ENV_API_ID_KEYS + tuple(
@@ -194,6 +206,10 @@ def print_banner() -> None:
 
 class TMediaError(Exception):
     """An error whose message is already safe and useful for a human."""
+
+
+class AccountAccessError(TMediaError):
+    """This account cannot see the post; another account should be tried."""
 
 
 def flood_seconds(exc: BaseException) -> Optional[int]:
@@ -292,6 +308,31 @@ def humanize_error(exc: BaseException) -> str:
     return "{0}: {1}".format(name, detail or "unexpected error")
 
 
+# Errors that mean "THIS account cannot see it", not "the link is broken".
+ACCESS_ERROR_NAMES = {
+    "ChannelPrivateError", "ChatForbiddenError", "ChatAdminRequiredError",
+    "UserNotParticipantError", "ChannelPublicGroupNaError", "ChannelInvalidError",
+    "PeerIdInvalidError", "InputConstructorInvalidError", "MessageIdInvalidError",
+    "InviteHashInvalidError", "EntityNotFoundError",
+}
+
+
+def is_access_error(exc: BaseException) -> bool:
+    """True when another logged-in account may be able to see this post."""
+    if isinstance(exc, AccountAccessError):
+        return True
+    if type(exc).__name__ in ACCESS_ERROR_NAMES:
+        return True
+    if isinstance(exc, TMediaError):
+        text = str(exc).lower()
+        return any(word in text for word in (
+            "not a member", "not visible", "cannot see", "could not be found",
+            "deleted or does not exist", "no logged-in account", "not authorised",
+        ))
+    # Telethon raises ValueError("Could not find the input entity for ...")
+    return isinstance(exc, ValueError)
+
+
 # ---------------------------------------------------------------------------
 # 3. Telegram link parsing / validation
 # ---------------------------------------------------------------------------
@@ -306,6 +347,9 @@ class TelegramLink:
     message_id: int
     channel_id: Optional[int]  # positive id without the -100 prefix
     kind: str  # "public" | "private"
+    topic_id: Optional[int] = None    # forum topic in /c/<chat>/<topic>/<msg>
+    comment_id: Optional[int] = None  # ?comment=<id> discussion reply
+    thread_id: Optional[int] = None   # ?thread=<id>
 
 
 def parse_link(raw: str) -> TelegramLink:
@@ -316,6 +360,7 @@ def parse_link(raw: str) -> TelegramLink:
         https://t.me/c/1234567890/123
         https://t.me/c/1234567890/12/987      (topic link)
         https://telegram.me/durov/123
+        https://t.me/durov/123?comment=45       (discussion reply)
 
     Rejects invite links, stories, album-less links and everything else with
     a short explanation instead of an exception traceback.
@@ -336,6 +381,16 @@ def parse_link(raw: str) -> TelegramLink:
     if not parts:
         raise TMediaError("Incomplete link. A message URL must end with a message number.")
 
+    query = parse_qs(parsed.query or "")
+
+    def query_int(key: str) -> Optional[int]:
+        for value in query.get(key, []):
+            if re.fullmatch(r"\d+", value or ""):
+                return int(value)
+        return None
+
+    comment_id = query_int("comment") or query_int("reply")
+    thread_id = query_int("thread") or query_int("topic")
     head = parts[0].lower()
 
     if head.startswith("+") or head in {
@@ -362,10 +417,11 @@ def parse_link(raw: str) -> TelegramLink:
             channel_id = int(raw_chat)
             entity = int("-100" + str(channel_id))
         message_id = int(nums[-1])
+        topic_id = int(nums[1]) if len(nums) >= 3 else thread_id
 
         if channel_id <= 0 or message_id <= 0:
             raise TMediaError("Malformed private link: chat and message ids must be positive.")
-        return TelegramLink(text, entity, message_id, channel_id, "private")
+        return TelegramLink(text, entity, message_id, channel_id, "private", topic_id, comment_id, thread_id)
 
     # Public link: /<username>/<message_id>[/<reply_id>]
     if len(parts) < 2 or not re.fullmatch(r"\d+", parts[-1]):
@@ -376,7 +432,7 @@ def parse_link(raw: str) -> TelegramLink:
     message_id = int(parts[-1])
     if message_id <= 0:
         raise TMediaError("Invalid message number in the link.")
-    return TelegramLink(text, username, message_id, None, "public")
+    return TelegramLink(text, username, message_id, None, "public", thread_id, comment_id, thread_id)
 
 
 def safe_filename(name: str) -> str:
@@ -426,6 +482,12 @@ def harden_session_permissions() -> None:
         os.chmod(CONFIG_DIR, 0o700)
         for item in CONFIG_DIR.glob("session.session*"):
             os.chmod(item, 0o600)
+        if ACCOUNTS_DIR.is_dir():
+            os.chmod(ACCOUNTS_DIR, 0o700)
+            for item in ACCOUNTS_DIR.glob("*.session*"):
+                os.chmod(item, 0o600)
+        if ACTIVE_ACCOUNT_FILE.exists():
+            os.chmod(ACTIVE_ACCOUNT_FILE, 0o600)
     except OSError:
         pass  # never let a cosmetic chmod break a successful download
 
@@ -703,6 +765,205 @@ def auto_import_session() -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 4b. Multi-account sessions (v1.2) -- ONE API pair, every authorised login
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Account:
+    label: str
+    path: Path
+    primary: bool = False
+
+
+def sanitize_label(text: str) -> str:
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(text).strip()).strip("-.")
+    return (label or "account")[:48]
+
+
+def ensure_accounts_dir() -> None:
+    ensure_config_dir()
+    try:
+        ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(ACCOUNTS_DIR, 0o700)
+    except OSError as exc:
+        raise TMediaError("Cannot create {0}: {1}".format(ACCOUNTS_DIR, humanize_error(exc)))
+
+
+def session_signature(path: Path) -> Optional[str]:
+    """Content hash, used so the same login is never registered twice."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def read_active_account() -> Optional[str]:
+    try:
+        return ACTIVE_ACCOUNT_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def write_active_account(label: str) -> None:
+    ensure_config_dir()
+    tmp = CONFIG_DIR / (".active_account." + uuid.uuid4().hex + ".tmp")
+    try:
+        tmp.write_text(label + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ACTIVE_ACCOUNT_FILE)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise TMediaError("Could not pin the account: {0}".format(humanize_error(exc)))
+
+
+def registered_accounts():
+    """Primary tmedia session + every valid named session in accounts/."""
+    found = []
+    seen = set()
+    if SESSION_FILE.exists() and is_telethon_session(SESSION_FILE):
+        found.append(Account("main", SESSION_FILE, True))
+        seen.add(session_signature(SESSION_FILE))
+    if ACCOUNTS_DIR.is_dir():
+        for path in sorted(ACCOUNTS_DIR.glob("*.session")):
+            if not is_telethon_session(path):
+                continue
+            signature = session_signature(path)
+            if signature and signature in seen:
+                continue
+            seen.add(signature)
+            found.append(Account(path.stem, path, not found))
+    return found
+
+
+def register_session(source: Path, label: Optional[str] = None) -> Account:
+    """Copy an authorised Telethon session into accounts/ (zero login)."""
+    source = Path(source).expanduser()
+    if not source.is_file() or not is_telethon_session(source):
+        raise TMediaError("Not an authorised Telethon .session file: {0}".format(source))
+    ensure_accounts_dir()
+    signature = session_signature(source)
+    for existing in ACCOUNTS_DIR.glob("*.session"):
+        if session_signature(existing) == signature:
+            return Account(existing.stem, existing, False)
+    name = sanitize_label(label or source.stem)
+    target = ACCOUNTS_DIR / (name + ".session")
+    try:
+        shutil.copyfile(source, target)
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        raise TMediaError("Could not register the session: {0}".format(humanize_error(exc)))
+    return Account(name, target, False)
+
+
+def auto_register_sessions(limit: int = MAX_EXTRA_ACCOUNTS) -> int:
+    """Bounded, read-only discovery of the other logged-in accounts on this PC."""
+    ensure_accounts_dir()
+    known = {session_signature(acc.path) for acc in registered_accounts()}
+    added = 0
+    for candidate in iter_session_files():
+        if added >= limit:
+            break
+        try:
+            if candidate.resolve().parent == ACCOUNTS_DIR.resolve():
+                continue
+            signature = session_signature(candidate)
+            if not signature or signature in known or not is_telethon_session(candidate):
+                continue
+            register_session(candidate)
+            known.add(signature)
+            added += 1
+        except (OSError, TMediaError):
+            continue
+    return added
+
+
+def resolve_account_choice(args):
+    """Ordered accounts: pinned account first, then the rest as fallbacks."""
+    accounts = registered_accounts()
+    explicit = getattr(args, "session", None) or os.environ.get("TMEDIA_SESSION")
+    label = getattr(args, "account", None) or os.environ.get("TMEDIA_ACCOUNT")
+
+    def with_first(first: Account):
+        rest = [Account(a.label, a.path, False) for a in accounts
+                if a.path.resolve() != first.path.resolve()]
+        return [Account(first.label, first.path, True)] + rest
+
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file() or not is_telethon_session(path):
+            raise TMediaError("Not an authorised Telethon session: {0}".format(path))
+        write_active_account(path.resolve().as_posix())
+        return with_first(Account(sanitize_label(path.stem), path, True))
+
+    wanted = label or read_active_account()
+    if wanted:
+        if "/" in wanted:
+            path = Path(wanted)
+            if path.is_file() and is_telethon_session(path):
+                return with_first(Account(sanitize_label(path.stem), path, True))
+        for acc in accounts:
+            if acc.label == wanted:
+                if label:
+                    write_active_account(wanted)
+                return with_first(acc)
+        if label:
+            raise TMediaError("No account named '{0}'. Run 'tmedia --list-accounts'.".format(label))
+    return accounts
+
+
+def list_accounts() -> int:
+    """Offline report of every usable login; no Telegram connection needed."""
+    auto_register_sessions()
+    accounts = registered_accounts()
+    active = read_active_account()
+    head = Table.grid(padding=(0, 2))
+    head.add_row(Text("Config dir", style="dim"), Text(str(CONFIG_DIR), style="white"))
+    head.add_row(Text("Accounts", style="dim"), Text(str(len(accounts)), style="bold white"))
+    head.add_row(Text("Pinned", style="dim"), Text(active or "(auto: first account)", style="white"))
+    console.print(Panel(head, title="tmedia --list-accounts", border_style="cyan", title_align="left"))
+    if not accounts:
+        console.print(Text(
+            "[!] No authorised session found. Run 'tmedia' once, or use --import-profile.",
+            style="yellow"))
+        return 0
+    grid = Table.grid(padding=(0, 2))
+    grid.add_row(Text("ACCOUNT", style="bold"), Text("SESSION", style="bold"), Text("ROLE", style="bold"))
+    for acc in accounts:
+        mark = "* " if acc.label == active else "  "
+        grid.add_row(
+            Text(mark + acc.label, style="bold white"),
+            Text(str(acc.path), style="dim"),
+            Text("primary" if acc.primary else "fallback", style="green" if acc.primary else "cyan"),
+        )
+    console.print(grid)
+    console.print(Text(
+        "> Pin one:  tmedia --account <name> -l <link>     |  --single-account disables fallback",
+        style="cyan"), soft_wrap=True)
+    return 0
+
+
+def add_account(label: str, source: Optional[Path]) -> int:
+    """Register a second/third login so private posts are always reachable."""
+    if source is None:
+        for candidate in iter_session_files():
+            if (candidate.resolve() != SESSION_FILE.resolve()
+                    and candidate.resolve().parent != ACCOUNTS_DIR.resolve()
+                    and is_telethon_session(candidate)):
+                source = candidate
+                break
+        if source is None:
+            raise TMediaError("No other authorised session found. Pass --session /path/to/x.session.")
+    acc = register_session(Path(source), label)
+    write_active_account(acc.label)
+    console.print(Text(
+        "[+] Account '{0}' registered at {1} (no login code needed).".format(acc.label, acc.path),
+        style="bold green"))
+    console.print(Text("    Use it:  tmedia --account {0} -l <link>".format(acc.label), style="dim"))
+    return 0
+
+
 def load_credentials(args) -> Credentials:
     """Never ask for API credentials if they can be recovered automatically."""
     ensure_config_dir()
@@ -842,6 +1103,13 @@ def doctor() -> int:
     grid.add_row(Text("Config dir", style="dim"), Text(str(CONFIG_DIR), style="white"))
     grid.add_row(Text("API credentials", style="dim"), Text(discovered[1] if discovered else "NOT FOUND", style="green" if discovered else "bold red"))
     grid.add_row(Text("Session", style="dim"), Text(session_state, style="green" if "valid" in session_state else "yellow"))
+    auto_register_sessions()
+    found_accounts = registered_accounts()
+    grid.add_row(
+        Text("Accounts", style="dim"),
+        Text("{0} usable; active: {1}".format(len(found_accounts), read_active_account() or "auto"),
+             style="green" if found_accounts else "yellow"),
+    )
     grid.add_row(Text("Telegram Desktop", style="dim"), Text(desktop or "not detected", style="white"))
     grid.add_row(Text("Downloads", style="dim"), Text(downloads, style="white"))
     grid.add_row(Text("Python", style="dim"), Text(platform.python_version() + " on " + platform.system(), style="white"))
@@ -870,12 +1138,13 @@ def do_logout() -> int:
     return 0
 
 
-async def interactive_login(client: TelegramClient, phone: str) -> None:
+async def interactive_login(client: TelegramClient, phone: str,
+                           session_path: Optional[Path] = None) -> None:
     """Clean Rich-based login (code + optional 2FA), no Telethon print() noise."""
     note = Text()
     note.append("Telegram will send a login code to your app / SMS.\n", style="white")
     note.append("Session will be saved at ", style="dim")
-    note.append(str(SESSION_FILE), style="dim bold")
+    note.append(str(session_path or SESSION_FILE), style="dim bold")
     console.print(Panel(note, title="Login", border_style="cyan"))
 
     # Credentials recovered from env / a shared config may legitimately have no
@@ -911,10 +1180,12 @@ async def interactive_login(client: TelegramClient, phone: str) -> None:
     raise TMediaError("Too many failed login attempts. Start tmedia again.")
 
 
-async def open_client(creds: Credentials) -> TelegramClient:
-    """Connect once; prompt for login only when the session is not authorised."""
+async def open_client(creds: Credentials, session_path: Optional[Path] = None,
+                      allow_login: bool = True) -> TelegramClient:
+    """Connect once. Only the primary account may prompt for a login code."""
+    session_path = Path(session_path) if session_path else SESSION_FILE
     client = TelegramClient(
-        str(SESSION_FILE),
+        str(session_path),
         creds.api_id,
         creds.api_hash,
         device_model="TMEDIA CLI",
@@ -929,12 +1200,79 @@ async def open_client(creds: Credentials) -> TelegramClient:
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            await interactive_login(client, creds.phone)
+            if not allow_login:
+                raise AccountAccessError(
+                    "Saved session '{0}' is not authorised; skipping it.".format(session_path.name)
+                )
+            await interactive_login(client, creds.phone, session_path)
         harden_session_permissions()
     except BaseException:
         await client.disconnect()
         raise
     return client
+
+
+class AccountPool:
+    """
+    ONE api_id/api_hash pair, several authorised accounts.
+
+    Clients are opened lazily: the pinned/primary account is tried first and
+    the others are connected only when Telegram says that account cannot see
+    the post. Every session is reused as-is, so no extra login is requested.
+    """
+
+    def __init__(self, creds: Credentials, accounts, try_all: bool = True):
+        self.creds = creds
+        self.accounts = list(accounts)
+        self.try_all = try_all
+        self._clients = {}
+        self._lock = None  # created inside the running loop (Python 3.8 safe)
+
+    def __len__(self) -> int:
+        return len(self.accounts)
+
+    async def _open(self, acc: Account):
+        if acc.label in self._clients:
+            return self._clients[acc.label]
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if acc.label in self._clients:
+                return self._clients[acc.label]
+            try:
+                client = await open_client(self.creds, acc.path, allow_login=acc.primary)
+            except Exception as exc:  # one unusable extra account must not abort
+                self._clients[acc.label] = None
+                console.print(Text(
+                    "[i] Skipping unusable account '{0}': {1}".format(acc.label, humanize_error(exc)),
+                    style="dim yellow"))
+                return None
+            self._clients[acc.label] = client
+            return client
+
+    async def primary(self):
+        if not self.accounts:
+            raise TMediaError("No authorised Telegram session found. Run 'tmedia' once, or import a profile.")
+        client = await self._open(self.accounts[0])
+        if client is None:
+            raise TMediaError("The primary account could not connect. Try 'tmedia --list-accounts'.")
+        return client
+
+    async def candidates(self):
+        targets = self.accounts if self.try_all else self.accounts[:1]
+        for acc in targets:
+            client = await self._open(acc)
+            if client is not None:
+                yield acc, client
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        harden_session_permissions()
 
 
 # ---------------------------------------------------------------------------
@@ -944,44 +1282,115 @@ async def open_client(creds: Credentials) -> TelegramClient:
 
 async def resolve_private_chat(client: TelegramClient, channel_id: int) -> object:
     """
-    Telethon can only resolve a bare ``-100…`` id once it has *seen* the chat.
-    Try the entity cache and the API first, then warm the cache from dialogs.
+    Turn a bare ``-100…`` id into an entity with an access_hash.
+
+    A fresh session has no entity cache: try the cache/API, then a direct
+    channels.GetChannels (works when the account is a member), then warm the
+    cache from the dialog list. Failure is *per-account*: AccountPool simply
+    moves on to the next logged-in account.
     """
-    peer = int("-100" + str(channel_id))
-    for resolver in (client.get_input_entity, client.get_entity):
-        try:
-            return await resolver(peer)
-        except Exception:
-            pass
+    peer_id = int("-100" + str(channel_id))
+    for candidate in (peer_id, types.PeerChannel(channel_id)):
+        for resolver in (client.get_input_entity, client.get_entity):
+            try:
+                return await resolver(candidate)
+            except Exception:
+                pass
+
+    try:
+        result = await client(
+            functions.channels.GetChannelsRequest(id=[types.PeerChannel(channel_id)])
+        )
+        for chat in getattr(result, "chats", None) or []:
+            if getattr(chat, "id", None) == channel_id:
+                return chat
+    except Exception:
+        pass
 
     try:
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
-            if isinstance(entity, types.Channel) and entity.id == channel_id:
+            if getattr(entity, "id", None) == channel_id:
                 return entity
     except Exception:
         pass
 
-    raise TMediaError(
-        "You are not a member of this private channel (or the link is invalid). "
-        "Join it in Telegram first, then retry."
+    raise AccountAccessError(
+        "This account is not a member of private channel {0} (or the link is invalid).".format(channel_id)
     )
 
 
+async def resolve_comment(client, link: TelegramLink, base_message):
+    """Resolve a ``?comment=<id>`` discussion reply (best effort)."""
+    if not link.comment_id:
+        return base_message
+    try:
+        message = await client.get_messages(link.entity, ids=link.comment_id)
+        if message is not None:
+            return message
+    except Exception:
+        pass
+    try:
+        replies = await client.get_messages(link.entity, reply_to=link.message_id, limit=200)
+        for message in replies or []:
+            if getattr(message, "id", None) == link.comment_id:
+                return message
+    except Exception:
+        pass
+    try:
+        result = await client(
+            functions.messages.GetDiscussionMessageRequest(peer=link.entity, msg_id=link.message_id)
+        )
+        for message in getattr(result, "messages", None) or []:
+            if getattr(message, "id", None) == link.comment_id:
+                return message
+    except Exception:
+        pass
+    return base_message
+
+
 async def resolve_message(client: TelegramClient, link: TelegramLink):
-    """Fetch exactly one message via MTProto (with private-chat cache recovery)."""
+    """Fetch one message, trying every way this account can legitimately see it."""
+    message = None
+    last_error = None
+
     try:
         message = await client.get_messages(link.entity, ids=link.message_id)
     except Exception as exc:
-        if isinstance(link.entity, int) and link.channel_id is not None:
+        last_error = exc
+
+    if message is None and link.kind == "private":
+        try:
+            message = await client.get_messages(types.PeerChannel(link.channel_id), ids=link.message_id)
+        except Exception as exc:
+            if last_error is None:
+                last_error = exc
+
+    if message is None and link.kind == "private":
+        try:
             entity = await resolve_private_chat(client, link.channel_id)
             message = await client.get_messages(entity, ids=link.message_id)
-        else:
-            raise exc
+        except Exception as exc:
+            if last_error is None:
+                last_error = exc
+
+    if message is None and link.kind == "public":
+        try:
+            entity = await client.get_entity(link.entity)
+            message = await client.get_messages(entity, ids=link.message_id)
+        except Exception as exc:
+            if last_error is None:
+                last_error = exc
 
     if message is None:
-        raise TMediaError("Message #{0} was deleted or does not exist.".format(link.message_id))
-    return message
+        if last_error is not None:
+            raise last_error
+        raise AccountAccessError(
+            "Message #{0} is not visible to this account (deleted, or this account cannot see the post).".format(
+                link.message_id
+            )
+        )
+    return await resolve_comment(client, link, message)
 
 
 @dataclass(frozen=True)
@@ -1225,13 +1634,50 @@ async def download_once(client, link: TelegramLink, opts: Options, reporter) -> 
             pass
 
 
-async def process_link(client, link: TelegramLink, opts: Options, reporter) -> str:
+async def download_with_accounts(pool: AccountPool, link: TelegramLink,
+                                 opts: Options, reporter) -> str:
+    """
+    Try the pinned account first; if Telegram says it cannot see the post,
+    continue with the other logged-in accounts (all using the ONE API pair).
+    """
+    errors = []
+    tried = 0
+    previous = ""
+    async for account, client in pool.candidates():
+        tried += 1
+        if tried > 1:
+            reporter.say(
+                "[i] '{0}' cannot see this post - trying account '{1}'…".format(previous, account.label),
+                "yellow",
+            )
+        try:
+            return await download_once(client, link, opts, reporter)
+        except Exception as exc:
+            if not is_access_error(exc):
+                raise
+            errors.append((account.label, humanize_error(exc)))
+            previous = account.label
+    if tried == 0:
+        raise TMediaError("No usable Telegram account is logged in. Run 'tmedia' once, or import a profile.")
+    if tried > 1:
+        raise TMediaError(
+            "None of the {0} logged-in accounts can access this post. Telegram only shows private "
+            "channel posts to members ({1}). Join the channel with that account, then retry.".format(
+                tried, errors[-1][1] if errors else "private content"
+            )
+        )
+    raise TMediaError(errors[-1][1] if errors else "This post could not be accessed.")
+
+
+async def process_link(source, link: TelegramLink, opts: Options, reporter) -> str:
     """Error boundary for one link. One bad URL can never abort a batch."""
     attempt = 0
     while True:
         attempt += 1
         try:
-            return await download_once(client, link, opts, reporter)
+            if isinstance(source, AccountPool):
+                return await download_with_accounts(source, link, opts, reporter)
+            return await download_once(source, link, opts, reporter)
         except TMediaError as exc:
             reporter.say("[!] Error: {0}".format(exc), "bold red")
             return "failed"
@@ -1409,7 +1855,7 @@ def read_links(path: Path):
 # ---------------------------------------------------------------------------
 
 
-async def direct_mode(client, opts: Options, url: Optional[str] = None) -> None:
+async def direct_mode(source, opts: Options, url: Optional[str] = None) -> None:
     if url is None:
         url = Prompt.ask("[bold cyan]Paste a Telegram message / media URL[/]").strip()
     try:
@@ -1418,10 +1864,10 @@ async def direct_mode(client, opts: Options, url: Optional[str] = None) -> None:
         console.print(Text("[!] Error: {0}".format(exc), style="bold red"))
         return
     with Reporter(console, opts.workers) as reporter:
-        await process_link(client, link, opts, reporter)
+        await process_link(source, link, opts, reporter)
 
 
-async def batch_mode(client, opts: Options, batch_file: Optional[Path] = None) -> None:
+async def batch_mode(source, opts: Options, batch_file: Optional[Path] = None) -> None:
     if batch_file is None:
         batch_file = pick_txt_file()
         if batch_file is None:
@@ -1458,7 +1904,7 @@ async def batch_mode(client, opts: Options, batch_file: Optional[Path] = None) -
             async def run_one(link: TelegramLink) -> None:
                 async with semaphore:
                     try:
-                        totals[await process_link(client, link, opts, reporter)] += 1
+                        totals[await process_link(source, link, opts, reporter)] += 1
                     finally:
                         reporter.advance_overall()
 
@@ -1466,7 +1912,7 @@ async def batch_mode(client, opts: Options, batch_file: Optional[Path] = None) -
         else:
             # Sequential, exactly as specified: one clean bar per file.
             for item in links:
-                totals[await process_link(client, item, opts, reporter)] += 1
+                totals[await process_link(source, item, opts, reporter)] += 1
                 reporter.advance_overall()
 
         summary = Text()
@@ -1479,7 +1925,7 @@ async def batch_mode(client, opts: Options, batch_file: Optional[Path] = None) -
         reporter.info(Panel(summary, title="Batch summary", border_style="cyan", title_align="left"))
 
 
-async def menu_loop(client, opts: Options) -> None:
+async def menu_loop(source, opts: Options) -> None:
     while True:
         menu = Text()
         menu.append("  [1] ", style="bold cyan")
@@ -1496,9 +1942,9 @@ async def menu_loop(client, opts: Options) -> None:
             return
         try:
             if choice == "1":
-                await direct_mode(client, opts)
+                await direct_mode(source, opts)
             else:
-                await batch_mode(client, opts)
+                await batch_mode(source, opts)
         except KeyboardInterrupt:
             console.print(Text("[i] Returning to the main menu.", style="yellow"))
 
@@ -1523,6 +1969,10 @@ def build_parser() -> argparse.ArgumentParser:
             "  tmedia --export-profile                 copy this login to another PC\n"
             "  tmedia --import-profile ~/p.tar.gz      zero-login setup on that PC\n"
             "  tmedia --api-id 12345 --api-hash HASH   set credentials non-interactively\n"
+            "  tmedia --list-accounts                  every logged-in account\n"
+            "  tmedia --add-account work --session S   register another account (zero login)\n"
+            "  tmedia --account work -l URL            pin that account for a private post\n"
+            "  tmedia --single-account -l URL          never try other accounts\n"
             "  tmedia --logout                         remove saved session\n"
         ),
     )
@@ -1546,6 +1996,13 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--export-profile", nargs="?", const="@auto", metavar="FILE", help="bundle config + session for another PC (default: ./tmedia-profile-<date>.tar.gz)")
     recovery.add_argument("--import-profile", metavar="FILE", help="restore a profile: ZERO new login")
     recovery.add_argument("--doctor", action="store_true", help="offline check of credentials, session and Telegram Desktop")
+
+    accounts = parser.add_argument_group("accounts (v1.2: one API pair, every login)")
+    accounts.add_argument("--account", metavar="NAME", help="pin a registered account (see --list-accounts)")
+    accounts.add_argument("--session", metavar="PATH", help="use/pin a specific Telethon .session for this run")
+    accounts.add_argument("--add-account", metavar="NAME", help="register an authorised session as a named account")
+    accounts.add_argument("--list-accounts", action="store_true", help="offline list of usable accounts")
+    accounts.add_argument("--single-account", action="store_true", help="do not fall back to other accounts")
 
     parser.add_argument("--logout", action="store_true", help="delete the local session and credentials")
     parser.add_argument("--no-banner", action="store_true", help="suppress the ASCII banner")
@@ -1584,29 +2041,54 @@ async def run(args) -> int:
     session_note = auto_import_session()
     if session_note:
         console.print(Text("[*] Session: {0}".format(session_note), style="dim green"))
+
+    added = auto_register_sessions()
+    if added:
+        console.print(Text(
+            "[*] Registered {0} other logged-in account(s) - no login code needed.".format(added),
+            style="dim green"))
+
+    accounts = resolve_account_choice(args)
+    single = bool(args.single_account or os.environ.get("TMEDIA_SINGLE_ACCOUNT"))
+    if single:
+        accounts = accounts[:1]
+    if not accounts:
+        raise TMediaError("No authorised Telegram session found. Run 'tmedia' once, or import a profile.")
+    accounts[0] = Account(accounts[0].label, accounts[0].path, True)
+
+    try_all = len(accounts) > 1
+    pool = AccountPool(creds, accounts, try_all=try_all)
     console.print(Text("[*] Connecting to Telegram…", style="dim"))
-    client = await open_client(creds)
+    client = await pool.primary()
     try:
         me = await client.get_me()
         who = "@" + me.username if getattr(me, "username", None) else (getattr(me, "first_name", None) or str(me.id))
         status = Text()
         status.append("  ●  Connected as ", style="green")
         status.append(who, style="bold white")
-        status.append("\n  Session:   ", style="dim")
-        status.append(str(SESSION_FILE), style="dim")
+        status.append("  (account: ", style="dim")
+        status.append(accounts[0].label, style="bold white")
+        status.append(")\n  Session:   ", style="dim")
+        status.append(str(accounts[0].path), style="dim")
+        status.append("\n  Accounts:  ", style="dim")
+        status.append(
+            "{0} available{1}".format(
+                len(accounts), " - private posts auto-fallback" if try_all else " (single-account mode)"
+            ),
+            style="dim",
+        )
         status.append("\n  Downloads: ", style="dim")
         status.append(str(opts.output), style="dim")
         console.print(Panel(status, title="Session", border_style="green", title_align="left"))
 
         if args.link:
-            await direct_mode(client, opts, url=args.link)
+            await direct_mode(pool, opts, url=args.link)
         elif args.batch:
-            await batch_mode(client, opts, batch_file=Path(args.batch))
+            await batch_mode(pool, opts, batch_file=Path(args.batch))
         else:
-            await menu_loop(client, opts)
+            await menu_loop(pool, opts)
     finally:
-        await client.disconnect()
-        harden_session_permissions()
+        await pool.aclose()
     return 0
 
 
@@ -1618,6 +2100,10 @@ def main() -> int:
             return import_profile(Path(args.import_profile))
         if args.export_profile is not None:
             return export_profile(None if args.export_profile == "@auto" else Path(args.export_profile))
+        if args.list_accounts:
+            return list_accounts()
+        if args.add_account:
+            return add_account(args.add_account, Path(args.session) if args.session else None)
         if args.doctor:
             return doctor()
         if args.logout:
